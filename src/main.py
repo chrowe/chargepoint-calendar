@@ -1,19 +1,15 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from python_chargepoint import ChargePoint
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from fetch_charging_sessions import fetch_charging_sessions
 
-# Set up ChargePoint
-chargepoint_username = os.getenv('CHARGEPOINT_USERNAME')
-chargepoint_password = os.getenv('CHARGEPOINT_PASSWORD')
-cp = ChargePoint(chargepoint_username, chargepoint_password)
-
 # Set up Google Calendar
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 SERVICE_ACCOUNT_FILE = 'credentials.json'
 calendar_id = os.getenv('GOOGLE_CALENDAR_ID')
+user_email = os.getenv('USER_EMAIL')
 
 credentials = service_account.Credentials.from_service_account_file(
     SERVICE_ACCOUNT_FILE, scopes=SCOPES)
@@ -26,56 +22,105 @@ def get_last_download_time():
         with open('last_download_time.txt', 'r') as file:
             return datetime.fromisoformat(file.read().strip())
     except FileNotFoundError:
-        return datetime.utcnow() - timedelta(days=1)
-
+        return datetime.now(UTC) - timedelta(days=1)
+    
 def update_last_download_time(time):
     with open('last_download_time.txt', 'w') as file:
         file.write(time.isoformat())
 
-def add_event_to_calendar(session):
-    start_time = session['start_time']
-    end_time = session['end_time']
-    description = f"Charging session at home: {session['energy_kWh']} kWh"
+def get_sessions():
+    session_list = []
 
-    event = {
-        'summary': 'EV Charging Session',
-        'description': description,
-        'start': {
-            'dateTime': start_time.isoformat(),
-            'timeZone': 'UTC',
-        },
-        'end': {
-            'dateTime': end_time.isoformat(),
-            'timeZone': 'UTC',
-        },
-    }
+    # Set up ChargePoint
+    chargepoint_username = os.getenv('CHARGEPOINT_USERNAME')
+    chargepoint_password = os.getenv('CHARGEPOINT_PASSWORD')
+    cp = ChargePoint(chargepoint_username, chargepoint_password)
 
-    event = service.events().insert(calendarId=calendar_id, body=event).execute()
-    print(f"Event created: {event.get('htmlLink')}")
-
-def main():
-    last_download_time = get_last_download_time()
-    print(f"Last download time: {last_download_time}")
-    
-    # Fetch charging sessions
+     # Fetch charging sessions
     response = fetch_charging_sessions(cp)
     month_info = response.json().get("charging_activity_monthly", {}).get("month_info", [])
     
     for sessions in month_info:
         for session in sessions.get("sessions", {}):
-            from datetime import datetime
+            session_list.append(session)
 
-            # Convert timestamp in milliseconds to datetime
-            start_time = datetime.fromtimestamp(session['start_time'] / 1000)
-            end_time = datetime.fromtimestamp(session['end_time'] / 1000)
+    return session_list
 
-            session_time = session['session_time'] / 60000 / 60
-            miles_added = session['miles_added']
+def add_event_to_calendar(session):
+    current_charging = session['current_charging']
+    if current_charging != "done":
+        print("Session is still ongoing, skipping event creation.")
+    else:
+        from datetime import datetime
+        # Convert timestamp in milliseconds to datetime
+        start_time = datetime.fromtimestamp(session['start_time'] / 1000)
+        end_time = datetime.fromtimestamp(session['end_time'] / 1000)
 
-            #add_event_to_calendar(session)
-            print(f'{session_time:.2f} hour long session from {start_time} to {end_time}, Energy:  kWh and {miles_added} miles added')
+        session_time = session['session_time'] / 60000 / 60
+        energy_kwh = session['energy_kwh']
+        miles_added = session['miles_added']
 
-    #update_last_download_time(datetime.datetime.now(datetime.UTC))
+        session_description = f'{session_time:.2f} hour long session from {start_time} to {end_time}, Energy: {energy_kwh} kWh and {miles_added} miles added'
+
+        event = {
+            'summary': f'EV Charging Session: {energy_kwh} kWh',
+            'description': session_description,
+            'start': {
+                'dateTime': start_time.isoformat(),
+                'timeZone': 'UTC',
+            },
+            'end': {
+                'dateTime': end_time.isoformat(),
+                'timeZone': 'UTC',
+            },
+        }
+
+        event = service.events().insert(calendarId=calendar_id, body=event).execute()
+        print(f"Event created: {event.get('htmlLink')}")
+
+def get_or_create_calendar(service, calendar_name, user_email):
+    # Check if the calendar exists
+    calendar_list = service.calendarList().list().execute()
+    for calendar in calendar_list['items']:
+        if calendar['summary'] == calendar_name:
+            return calendar['id']
+    
+    # Create the calendar if it doesn't exist
+    calendar = {
+        'summary': calendar_name,
+        'timeZone': 'UTC'
+    }
+    created_calendar = service.calendars().insert(body=calendar).execute()
+    
+    # Give yourself access to the calendar
+    rule = {
+        'scope': {
+            'type': 'user',
+            'value': user_email,
+        },
+        'role': 'owner'
+    }
+    service.acl().insert(calendarId=created_calendar['id'], body=rule).execute()
+    
+    return created_calendar['id']
+
+
+def main():
+    global calendar_id
+    print(user_email)
+    calendar_id = get_or_create_calendar(service, "Chargepoint charging", user_email)
+    print(f"Using calendar ID: {calendar_id}")
+
+    last_download_time = get_last_download_time()
+    print(f"Last download time: {last_download_time}")
+
+    session_descriptions = get_sessions()
+ 
+    for session in session_descriptions:
+        # Uncomment the following line to add events to Google Calendar
+        add_event_to_calendar(session)
+
+    #update_last_download_time(datetime.now(UTC))
 
 if __name__ == '__main__':
     main()
